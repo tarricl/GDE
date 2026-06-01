@@ -1,0 +1,1259 @@
+---
+title: "Candidate Method Equivalence Report"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    theme: cosmo
+    embed-resources: true
+params:
+  output_dir: ".."
+  input_file: "input"
+  scenario: "type_testing"
+  run_mode: "full_workflow"
+---
+
+```{r setup, include=FALSE}
+library(dplyr)
+library(readr)
+library(knitr)
+library(stringr)
+library(tibble)
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE, results = "asis")
+
+output_dir <- params$output_dir
+
+read_csv_safe <- function(path) {
+  if (file.exists(path)) {
+    readr::read_csv(path, show_col_types = FALSE)
+  } else {
+    tibble::tibble()
+  }
+}
+
+summary_method <- read_csv_safe(file.path(output_dir, "03_uncertainty_tables", "method_summary.csv"))
+final_site <- read_csv_safe(file.path(output_dir, "03_uncertainty_tables", "final_site_combined_assessment.csv"))
+daily_unit <- read_csv_safe(file.path(output_dir, "03_uncertainty_tables", "daily_unit_results.csv"))
+daily_comparison <- read_csv_safe(file.path(output_dir, "03_uncertainty_tables", "daily_lv_comparison_metrics.csv"))
+daily_site <- read_csv_safe(file.path(output_dir, "03_uncertainty_tables", "daily_site_campaign_results.csv"))
+annual_unit <- read_csv_safe(file.path(output_dir, "03_uncertainty_tables", "annual_unit_results.csv"))
+annual_site <- read_csv_safe(file.path(output_dir, "03_uncertainty_tables", "annual_site_results.csv"))
+rm_screen <- read_csv_safe(file.path(output_dir, "00_run_log", "rm_screening_summary.csv"))
+rm_diag <- read_csv_safe(file.path(output_dir, "02_diagnostics", "rm_diagnostics.csv"))
+lin_diag <- read_csv_safe(file.path(output_dir, "02_diagnostics", "linearity_diagnostics.csv"))
+diff_diag <- read_csv_safe(file.path(output_dir, "02_diagnostics", "difference_diagnostics.csv"))
+diff_site_diag <- read_csv_safe(file.path(output_dir, "02_diagnostics", "difference_site_campaign_diagnostics.csv"))
+input_check <- read_csv_safe(file.path(output_dir, "00_run_log", "input_data_check.csv"))
+filters <- read_csv_safe(file.path(output_dir, "00_run_log", "available_filters.csv"))
+corrections <- read_csv_safe(file.path(output_dir, "03_uncertainty_tables", "correction_coefficients.csv"))
+config_used <- read_csv_safe(file.path(output_dir, "00_run_log", "configuration_used.csv"))
+neff_inputs <- read_csv_safe(file.path(output_dir, "03_uncertainty_tables", "V_Neff_inputs.csv"))
+
+has_rm_evaluation <- nrow(rm_screen) > 0 &&
+  "n_rows_with_rm_duplicates" %in% names(rm_screen) &&
+  any(rm_screen$n_rows_with_rm_duplicates > 0, na.rm = TRUE)
+
+sort_for_report <- function(df) {
+  if (nrow(df) == 0) return(df)
+  if ("Stage" %in% names(df)) {
+    df <- df %>% mutate(Stage = factor(Stage, levels = c("No correction", "After correction")))
+  }
+  order_cols <- intersect(c("Instrument", "Size", "CM_type", "Site", "Campaign", "Stage", "correction_model"), names(df))
+  if (length(order_cols) > 0) df <- df %>% arrange(across(all_of(order_cols)))
+  if ("Stage" %in% names(df)) df <- df %>% mutate(Stage = as.character(Stage))
+  df
+}
+
+compact_result <- function(x) {
+  x <- as.character(x)
+  dplyr::case_when(
+    is.na(x) ~ NA_character_,
+    grepl("WARNING_LOW_N|LOW_N|LOW N", x, ignore.case = TRUE) ~ "LOW N",
+    x %in% c("NOT_ASSESSABLE_DAILY", "NOT_ASSESSABLE_ANNUAL", "NOT_ASSESSABLE") ~ "NOT ASSESSABLE",
+    x == "NO_DATA" ~ "NO DATA",
+    x == "PASS_ANNUAL_ONLY_DAILY_NOT_ASSESSABLE" ~ "PASS",
+    x %in% c("FAIL_GLOBAL", "FAIL_SITE_SPECIFIC") ~ "FAIL",
+    TRUE ~ gsub("_", " ", x)
+  )
+}
+
+format_status <- function(x) {
+  display <- compact_result(x)
+  dplyr::case_when(
+    grepl("FAIL", display, ignore.case = TRUE) ~ paste0("<span class='status-fail'>", display, "</span>"),
+    grepl("PASS", display, ignore.case = TRUE) ~ paste0("<span class='status-pass'>", display, "</span>"),
+    grepl("WARNING|NOT ASSESSABLE|NO DATA|LOW N", display, ignore.case = TRUE) ~ paste0("<span class='status-warning'>", display, "</span>"),
+    TRUE ~ display
+  )
+}
+
+fmt_num <- function(x, digits = 1) {
+  ifelse(is.na(x), NA_character_, format(round(as.numeric(x), digits), nsmall = digits, trim = TRUE))
+}
+
+warn_cell <- function(x) {
+  paste0("<span class='diag-exceed'>", x, "</span>")
+}
+
+rename_report_cols <- function(df) {
+  if (nrow(df) == 0) return(df)
+
+  rename_map <- c(
+    "Size" = "Pollutant",
+    "CM_type" = "CM",
+    "Campaign" = "Site",
+    "R2" = "R²",
+    "R2_threshold" = "R² min",
+    "n_CM_units" = "CM units",
+    "SD_res" = "SD res",
+    "residual_SD" = "SD res",
+    "SD_diff" = "SD(diff)",
+    "ci95_abs" = "CI95 abs",
+    "mean_RM" = "RM mean",
+    "mean_CM" = "CM mean",
+    "mean_y" = "CM mean",
+    "mean_RM_daily" = "RM mean d",
+    "mean_CM_daily" = "CM mean d",
+    "mean_RM_annual" = "RM mean y",
+    "mean_CM_annual" = "CM mean y",
+    "u_daily_rel_LV_pct" = "Decomposed daily (%LVd)",
+    "WAMS_full_rel_LV_pct" = "WAMS full (%LVd)",
+    "WAMS_LV_window_rel_LV_pct" = "WAMS LV-window (%LVd)",
+    "CI95_rel_LV_pct" = "CI95 (%LVd)",
+    "ci95_rel_LV_pct" = "CI95 (%LVd)",
+    "Utot_rel_LV_pct" = "Utot (%LVd)",
+    "Udiff_rel_LV_pct" = "Udiff (%LVd)",
+    "u_annual_rel_LV_pct" = "Uann (%LVy)",
+    "u_daily_bias" = "Bias d",
+    "u_annual_bias" = "Bias y",
+    "u_annual_random" = "Random y",
+    "scorr" = "Random",
+    "daily_status" = "Result d",
+    "daily_method_status" = "Result d",
+    "daily_decision_metric" = "Metric d",
+    "daily_metric_rel_LV_pct" = "Metric d (%LVd)",
+    "annual_status" = "Result y",
+    "annual_method_status" = "Result y",
+    "daily_site_status" = "Result d",
+    "annual_site_status" = "Result y",
+    "daily_assessment_status" = "Result d",
+    "annual_assessment_status" = "Result y",
+    "final_site_status" = "Final",
+    "final_method_status" = "Final",
+    "n_site_fails" = "n site fails",
+    "decision_basis" = "Basis",
+    "diagnostic_status" = "Result",
+    "main_issue" = "Main issue",
+    "linearity_status" = "Result",
+    "rm_screening_status" = "RM result",
+    "n_rows" = "n measurements",
+    "n_measurements" = "n measurements",
+    "n_rows_with_rm_duplicates" = "n RM pairs",
+    "n_RM_pairs" = "n RM pairs",
+    "n_excluded" = "n excluded",
+    "pct_RM_excluded" = "Excluded (%)",
+    "n_LV" = "nLV",
+    "n_LV_total" = "nLV",
+    "n_annual" = "nAnn",
+    "n_regression" = "n fit",
+    "n_regression_total" = "n total",
+    "n_regression_excluded" = "n excluded",
+    "n_linearity_total" = "n total",
+    "n_linearity_excluded" = "n excluded",
+    "tls_fit_range" = "Fit range",
+    "slope" = "Slope",
+    "intercept" = "Intercept",
+    "correction_model" = "Model",
+    "ratio_factor" = "Ratio factor",
+    "Neff_input" = "Neff input"
+  )
+
+  nm <- names(df)
+  for (old in names(rename_map)) {
+    if (old %in% nm) nm[nm == old] <- unname(rename_map[[old]])
+  }
+  names(df) <- nm
+  df
+}
+
+
+is_single_value_col <- function(df, col) {
+  if (!col %in% names(df)) return(FALSE)
+  vals <- unique(stats::na.omit(as.character(df[[col]])))
+  length(vals) <= 1
+}
+
+drop_redundant_id_columns <- function(df) {
+  if (nrow(df) == 0) return(df)
+
+  # Campaign and Site represent the same reporting block in this workflow.
+  # Keep Site and hide Campaign in report tables whenever both are present.
+  if (all(c("Site", "Campaign") %in% names(df))) {
+    df <- df %>% select(-Campaign)
+  }
+
+  # Hide identifiers that are constant in the current table.
+  for (col in c("Instrument", "Size", "CM_type")) {
+    if (is_single_value_col(df, col)) {
+      df <- df %>% select(-all_of(col))
+    }
+  }
+
+  df
+}
+
+apply_stage_badges <- function(df) {
+  if (!"Stage" %in% names(df)) return(df)
+
+  df %>%
+    mutate(
+      Stage = dplyr::case_when(
+        Stage == "No correction" ~ "<span class='stage-badge stage-raw'>No correction</span>",
+        Stage == "After correction" ~ "<span class='stage-badge stage-corrected'>After correction</span>",
+        TRUE ~ as.character(Stage)
+      )
+    )
+}
+
+prepare_report_table <- function(df, digits = 1) {
+  if (nrow(df) == 0) return(df)
+  df <- sort_for_report(df)
+  df <- drop_redundant_id_columns(df)
+  df <- df %>% mutate(across(where(is.numeric), ~ round(.x, digits)))
+  st_cols <- grep("status|result|final|flag|pass", names(df), ignore.case = TRUE, value = TRUE)
+  if (length(st_cols) > 0) df <- df %>% mutate(across(all_of(st_cols), format_status))
+  df <- apply_stage_badges(df)
+  rename_report_cols(df)
+}
+
+format_table <- function(df, digits = 1) {
+  prepare_report_table(df, digits = digits)
+}
+
+
+format_v_source_label <- function(x) {
+  dplyr::case_when(
+    x == "equivalence_RMAVG" ~ "Equivalence RMAVG",
+    x == "equivalence_CM" ~ "Equivalence CM",
+    x == "auxiliary_site_series" ~ "Auxiliary site series",
+    x == "pollutant_representative_Vrep" ~ "Pollutant Vrep fallback",
+    TRUE ~ as.character(x)
+  )
+}
+
+prepare_neff_annex_table <- function(df) {
+  if (nrow(df) == 0) return(df)
+
+  out <- df %>%
+    mutate(
+      V_source_label = format_v_source_label(V_source),
+      n_consecutive_pairs = dplyr::case_when(
+        V_source == "equivalence_RMAVG" & "rm_n_pairs" %in% names(df) ~ rm_n_pairs,
+        V_source == "equivalence_CM" & "cm_n_pairs" %in% names(df) ~ cm_n_pairs,
+        V_source == "auxiliary_site_series" & "aux_n_pairs" %in% names(df) ~ aux_n_pairs,
+        TRUE ~ n_pairs
+      ),
+      Vrep_display = ifelse(V_source == "pollutant_representative_Vrep", Vrep, NA_real_)
+    )
+
+  # Keep Vrep fallback only when it is actually used in at least one row.
+  cols <- c("Instrument", "Size", "Campaign", "V_source_label", "n_observations",
+            "n_dates", "n_consecutive_pairs", "rho1", "V_used", "Neff_input")
+
+  if (any(out$V_source == "pollutant_representative_Vrep", na.rm = TRUE)) {
+    cols <- c("Instrument", "Size", "Campaign", "V_source_label", "n_observations",
+              "n_dates", "n_consecutive_pairs", "rho1", "Vrep_display", "V_used", "Neff_input")
+  }
+
+  result <- out %>%
+    select(any_of(cols))
+
+  if ("V_source_label" %in% names(result)) {
+    result <- result %>% rename(V_source = V_source_label)
+  }
+  if ("Vrep_display" %in% names(result)) {
+    result <- result %>% rename(Vrep_fallback = Vrep_display)
+  }
+
+  result
+}
+
+
+get_config_value <- function(parameter, default = NA_character_) {
+  if (nrow(config_used) == 0 || !"Parameter" %in% names(config_used) || !"Value" %in% names(config_used)) {
+    return(default)
+  }
+  hit <- config_used %>%
+    filter(tolower(.data$Parameter) == tolower(parameter)) %>%
+    pull(.data$Value)
+  if (length(hit) == 0 || is.na(hit[1])) default else hit[1]
+}
+
+rm_duplicate_threshold_value <- function() {
+  suppressWarnings(as.numeric(get_config_value("RM duplicate threshold", NA_real_)))
+}
+
+rm_warning_threshold_value <- function() {
+  x <- get_config_value("RM warning threshold", NA_character_)
+  suppressWarnings(as.numeric(gsub("%", "", x)))
+}
+
+rm_threshold_text <- function() {
+  rm_thr <- rm_duplicate_threshold_value()
+  rm_warn <- rm_warning_threshold_value()
+  paste0(
+    "In this run, the duplicate-RM threshold is ",
+    ifelse(is.finite(rm_thr), paste0(rm_thr, " µg/m³"), "not available"),
+    " and the warning threshold is ",
+    ifelse(is.finite(rm_warn), paste0(rm_warn, "%"), "not available"),
+    "."
+  )
+}
+
+rm_result_from_pct <- function(pct) {
+  warn <- rm_warning_threshold_value()
+  dplyr::case_when(
+    is.na(pct) ~ "NOT ASSESSABLE",
+    is.finite(warn) & pct <= warn ~ "PASS",
+    is.finite(warn) & pct > warn ~ "WARNING",
+    TRUE ~ "NOT ASSESSABLE"
+  )
+}
+
+prepare_rm_duplicate_summary_table <- function(df) {
+  if (nrow(df) == 0) return(df)
+  df %>%
+    transmute(
+      n_RM_pairs = n_rows_with_rm_duplicates,
+      n_above_RM_threshold = n_rm_excluded,
+      pct_above_RM_threshold = pct_excluded_duplicate_denominator,
+      Result = rm_result_from_pct(pct_excluded_duplicate_denominator)
+    )
+}
+
+prepare_rm_duplicate_site_table <- function(df) {
+  if (nrow(df) == 0) return(df)
+  df %>%
+    mutate(Result = rm_result_from_pct(pct_RM_excluded)) %>%
+    arrange(desc(pct_RM_excluded), Size, Campaign) %>%
+    select(any_of(c(
+      "Instrument", "Size", "Campaign",
+      "n_RM_duplicates", "RM_abs_diff_mean", "RM_diff_SD",
+      "n_RM_excluded", "pct_RM_excluded", "Result"
+    )))
+}
+
+
+
+show_table <- function(df, digits = 1) {
+  if (nrow(df) == 0) {
+    cat("_No data available._
+")
+  } else {
+    cat(knitr::kable(format_table(df, digits), digits = digits, align = "c", escape = FALSE), sep = "
+")
+    cat("
+
+")
+  }
+}
+
+highlight_diagnostic_exceedances <- function(df, digits = 1) {
+  if (nrow(df) == 0) return(df)
+  raw <- sort_for_report(df)
+  out <- raw
+
+  mbe_thr <- if ("MBE_threshold" %in% names(raw)) raw$MBE_threshold else rep(1.0, nrow(raw))
+  sd_thr <- if ("SD_threshold" %in% names(raw)) raw$SD_threshold else rep(2.5, nrow(raw))
+  skew_thr <- if ("skewness_threshold" %in% names(raw)) raw$skewness_threshold else rep(0.5, nrow(raw))
+  kurt_thr <- if ("kurtosis_threshold" %in% names(raw)) raw$kurtosis_threshold else rep(4.0, nrow(raw))
+  ubscm_thr <- if ("Ubs_CM_threshold" %in% names(raw)) raw$Ubs_CM_threshold else rep(2.5, nrow(raw))
+
+  out <- out %>% mutate(across(where(is.numeric), ~ fmt_num(.x, digits)))
+
+  if ("MBE" %in% names(raw)) {
+    idx <- is.finite(raw$MBE) & abs(raw$MBE) > mbe_thr
+    out$MBE[idx] <- warn_cell(out$MBE[idx])
+  }
+  if ("SD_diff" %in% names(raw)) {
+    idx <- is.finite(raw$SD_diff) & raw$SD_diff > sd_thr
+    out$SD_diff[idx] <- warn_cell(out$SD_diff[idx])
+  }
+  if ("skewness" %in% names(raw)) {
+    idx <- is.finite(raw$skewness) & abs(raw$skewness) > skew_thr
+    out$skewness[idx] <- warn_cell(out$skewness[idx])
+  }
+  if ("kurtosis" %in% names(raw)) {
+    idx <- is.finite(raw$kurtosis) & raw$kurtosis > kurt_thr
+    out$kurtosis[idx] <- warn_cell(out$kurtosis[idx])
+  }
+  if ("Ubs_CM" %in% names(raw)) {
+    idx <- is.finite(raw$Ubs_CM) & raw$Ubs_CM > ubscm_thr
+    out$Ubs_CM[idx] <- warn_cell(out$Ubs_CM[idx])
+  }
+
+  st_cols <- grep("status|result|final|flag|pass", names(out), ignore.case = TRUE, value = TRUE)
+  if (length(st_cols) > 0) out <- out %>% mutate(across(all_of(st_cols), format_status))
+
+  out %>%
+    select(-any_of(c("MBE_threshold", "SD_threshold", "skewness_threshold", "kurtosis_threshold", "Ubs_CM_threshold"))) %>%
+    drop_redundant_id_columns() %>%
+    apply_stage_badges() %>%
+    rename_report_cols()
+}
+
+highlight_linearity_exceedances <- function(df, digits = 2) {
+  if (nrow(df) == 0) return(df)
+  raw <- sort_for_report(df)
+  out <- raw %>% mutate(across(where(is.numeric), ~ fmt_num(.x, digits)))
+  if (all(c("R2", "R2_threshold") %in% names(raw))) {
+    idx <- is.finite(raw$R2) & round(raw$R2, digits) < round(raw$R2_threshold, digits)
+    out$R2[idx] <- warn_cell(out$R2[idx])
+  }
+  st_cols <- grep("status|result|final|flag|pass", names(out), ignore.case = TRUE, value = TRUE)
+  if (length(st_cols) > 0) out <- out %>% mutate(across(all_of(st_cols), format_status))
+  rename_report_cols(out)
+}
+
+show_diagnostic_table <- function(df, digits = 1) {
+  if (nrow(df) == 0) {
+    cat("_No data available._
+")
+  } else {
+    cat(knitr::kable(highlight_diagnostic_exceedances(df, digits), digits = digits, align = "c", escape = FALSE), sep = "
+")
+    cat("
+
+")
+  }
+}
+
+show_linearity_table <- function(df, digits = 2) {
+  if (nrow(df) == 0) {
+    cat("_No data available._
+")
+  } else {
+    cat(knitr::kable(highlight_linearity_exceedances(df, digits), digits = digits, align = "c", escape = FALSE), sep = "
+")
+    cat("
+
+")
+  }
+}
+
+show_plot <- function(rel_path) {
+  path <- file.path(output_dir, rel_path)
+  if (file.exists(path)) {
+    path_norm <- normalizePath(path, winslash = "/", mustWork = TRUE)
+    uri <- knitr::image_uri(path_norm)
+    cat(sprintf('\n\n<img src="%s" style="display:block; margin-left:auto; margin-right:auto; max-width:95%%; height:auto;" />\n\n', uri))
+  } else {
+    cat(sprintf('\n\n_Figure not available: `%s`._\n\n', rel_path))
+  }
+}
+
+
+table_note <- function(text) {
+  cat(sprintf("\n\n<div class='table-note'>%s</div>\n\n", text))
+}
+
+figure_note <- function(text) {
+  cat(sprintf("\n\n<div class='figure-note'>%s</div>\n\n", text))
+}
+```
+
+<style>
+.table { font-size: 0.92em; }
+
+table { margin-left: auto; margin-right: auto; font-size: 0.88em; }
+th, td { text-align: center !important; vertical-align: middle !important; padding: 0.25em 0.45em !important; }
+.status-pass { color: #008000; font-weight: 700; }
+.status-fail { color: #C00000; font-weight: 700; }
+.status-warning { color: #C08000; font-weight: 700; }
+.diag-exceed { background-color: #F4B183; color: #000000; font-weight: 700; padding: 0.1em 0.35em; border-radius: 0.25em; }
+.stage-badge { display: inline-block; padding: 0.12em 0.45em; border-radius: 0.45em; font-weight: 600; white-space: nowrap; }
+.stage-raw { background-color: #F2F2F2; color: #333333; border: 1px solid #DDDDDD; }
+.stage-corrected { background-color: #EAF3F8; color: #1F4E5F; border: 1px solid #C9DEE8; }
+img { display: block; margin-left: auto; margin-right: auto; max-width: 100%; }
+.table-note, .figure-note { font-size: 0.86em; color: #555555; text-align: center; margin-top: 0.35em; margin-bottom: 1.0em; font-style: italic; }
+</style>
+
+# Metadata
+
+This section records the main processing settings and provides traceability for the generated assessment. Report tables hide identifier columns that have a single value in the current table; the hidden identifiers are reported here instead.
+
+- **Input file:** `r params$input_file`
+- **Scenario:** `r params$scenario`
+- **Run mode:** `r params$run_mode`
+- **Output directory:** `r output_dir`
+- **Instrument(s):** `r if (nrow(summary_method) > 0 && "Instrument" %in% names(summary_method)) paste(unique(summary_method$Instrument), collapse = ", ") else "not available"`
+- **Pollutant(s):** `r if (nrow(summary_method) > 0 && "Size" %in% names(summary_method)) paste(unique(summary_method$Size), collapse = ", ") else "not available"`
+- **Candidate unit(s):** `r if (nrow(daily_unit) > 0 && "CM_type" %in% names(daily_unit)) paste(unique(daily_unit$CM_type), collapse = ", ") else "not available"`
+
+## Configuration used
+
+```{r}
+if (nrow(config_used) > 0) {
+  show_table(config_used, digits = 2)
+  table_note("Configuration used for this run. These values control correction model, daily decision metric, diagnostic thresholds, linearity thresholds, limit-value windows and minimum data requirements.")
+} else {
+  cat("_No configuration table available._\n")
+}
+```
+
+
+# Executive summary
+
+This section answers the question: **does the candidate method satisfy the daily and annual requirements at both global and site/campaign level before and/or after correction?**
+
+```{r}
+if (nrow(summary_method) > 0) {
+  summary_display <- summary_method
+  if (!"main_issue" %in% names(summary_display)) {
+    summary_display <- summary_display %>%
+      mutate(
+        main_issue = dplyr::case_when(
+          grepl("FAIL", daily_method_status, ignore.case = TRUE) ~ "Daily fail",
+          grepl("FAIL", annual_method_status, ignore.case = TRUE) ~ "Annual fail",
+          grepl("WARNING|LOW_N", daily_method_status, ignore.case = TRUE) ~ "LOW N",
+          grepl("NOT_ASSESSABLE|NO_DATA", daily_method_status, ignore.case = TRUE) & annual_method_status == "PASS" ~ "Annual fallback",
+          TRUE ~ "None"
+        )
+      )
+  }
+  summary_display %>%
+    select(any_of(c("Instrument", "Size", "Stage", "daily_method_status", "annual_method_status", "n_site_fails", "final_method_status", "main_issue"))) %>%
+    show_table(digits = 1)
+  table_note("Executive summary of global and site-level daily/annual results. FAIL is dominant: Final is FAIL if daily fails or annual fails. Daily LOW N or NOT ASSESSABLE can still lead to PASS when the annual assessment passes. Main issue reports failure causes only when Final is FAIL; for PASS rows it reports none, LOW N, or annual fallback when relevant.")
+} else {
+  show_table(summary_method, digits = 1)
+}
+```
+
+```{r, echo=FALSE, results='asis'}
+if (has_rm_evaluation) {
+  cat("# Reference method duplicate screening\n\n")
+  cat("This section evaluates whether the duplicate reference measurements are sufficiently consistent to support the CM--RM comparison. It is shown only when both `RM1` and `RM2` are available. The screening is based on the absolute duplicate difference `|RM1−RM2|`; it is not an air-quality limit-value exceedance assessment.\n\n")
+  cat("Rows with `|RM1−RM2|` above the configured duplicate-RM threshold are removed from the screened dataset before correction, diagnostics and uncertainty calculations. The percentage of such rows is then compared with the configured warning threshold to assess the robustness of the reference system.\n\n")
+
+  cat("## Overall RM duplicate screening result\n\n")
+  show_table(prepare_rm_duplicate_summary_table(rm_screen), digits = 1)
+  table_note(paste0(
+    "Result refers only to duplicate RM agreement. PASS means that the percentage of duplicate RM pairs above the configured threshold is less than or equal to the configured warning threshold. WARNING means that the percentage is higher. NOT ASSESSABLE means that duplicate RM data are unavailable. ",
+    rm_threshold_text()
+  ))
+  cat("\n\n")
+
+  if (nrow(rm_diag) > 0) {
+    cat("## RM duplicate agreement by site\n\n")
+    cat("This table identifies whether the duplicate-RM disagreement is distributed across sites or concentrated in specific site/pollutant blocks. It is diagnostic support for interpreting the reference system, not a CM performance result.\n\n")
+    show_table(prepare_rm_duplicate_site_table(rm_diag), digits = 1)
+    table_note(paste0(
+      "The columns labelled 'above RM threshold' count duplicate RM pairs for which |RM1−RM2| is greater than the configured duplicate-RM threshold. Mean |RM1−RM2| and SD(RM1−RM2) describe the magnitude and variability of the duplicate-RM differences. ",
+      rm_threshold_text()
+    ))
+    cat("\n\n")
+  }
+
+  cat("## RM duplicate diagnostic plots\n\n")
+  cat("The plots below support visual inspection of duplicate-RM agreement. They are used to identify isolated large differences, concentration-dependent behaviour, distributional asymmetry and temporal patterns in `RM1−RM2`.\n\n")
+  show_plot("02_diagnostics/plots/rm_duplicate_scatter.png")
+  figure_note("RM1 versus RM2. The equality line represents perfect agreement between duplicate reference measurements.")
+  show_plot("02_diagnostics/plots/rm_duplicate_bland_altman.png")
+  figure_note("Duplicate-RM difference as a function of the duplicate-RM average. Horizontal reference lines show the configured duplicate-RM threshold.")
+  show_plot("02_diagnostics/plots/rm_duplicate_histogram.png")
+  figure_note("Distribution of RM1−RM2 differences. The plot helps identify asymmetry or broad duplicate-RM disagreement.")
+  show_plot("02_diagnostics/plots/rm_duplicate_time_series.png")
+  figure_note("RM1−RM2 over time. The plot helps identify temporal periods with unstable duplicate-RM agreement.")
+}
+```
+
+# Linearity and correction coefficients
+
+This section answers the question: **is the CM--RM relationship suitable for linearity assessment and, if needed, correction?** The regression used for linearity and TLS correction is restricted to a defined fitting range, while the uncertainty assessments retain their own datasets.
+
+## High concentration and outlier handling
+
+Very high concentration episodes can dominate slope and intercept estimates, especially when they are few compared with the main regulatory concentration range. For this reason, the workflow uses the following fixed fitting range for linearity and, when applicable, regression-based correction:
+
+$$
+0 \le RM_{AVG} \le 1.5\,LV_d
+$$
+
+where:
+
+- $RM_{AVG}$ is the working reference concentration for each paired observation.
+- $LV_d$ is the daily limit value for the pollutant under assessment.
+- The multiplier 1.5 defines the upper concentration bound used only for the regression-based linearity and correction step.
+
+This range is independent of the observed data distribution and remains comparable across datasets. A data-adaptive range such as 0--95th percentile can be useful as a sensitivity analysis, but it changes from dataset to dataset and may exclude different concentration ranges in different campaigns. Cook's distance can also be useful as an influence diagnostic, but it is based on an OLS influence framework and should not be used as an automatic exclusion rule for the TLS correction without manual review.
+
+Values above $1.5\,LV_d$ are excluded only from the linearity/correction fitting step and from the LOESS smoother in the CM--RM versus RM diagnostic plot. They remain visible as black points in the plot and remain available for the annual uncertainty assessment and for all other screened-data calculations.
+
+## Linearity
+
+This section evaluates whether the CM--RM relationship is sufficiently linear to support the assessment and, if required, a regression-based correction. The linearity fit is restricted to the configured fitting range shown in the table. `SD res` is the standard deviation of residuals from the linearity fit; it measures the remaining scatter around the fitted linear relationship after accounting for the average linear trend.
+
+```{r}
+if (nrow(lin_diag) > 0) {
+  lin_diag %>%
+    select(any_of(c("Instrument", "Size", "CM_type", "Stage", "tls_fit_range", "n", "n_linearity_total", "n_linearity_excluded", "R2", "R2_threshold", "SD_res", "linearity_status"))) %>%
+    show_linearity_table(digits = 2)
+  table_note("Linearity diagnostics are fitted only in the configured fitting range shown in the table. R² is assessed using the displayed two-decimal value; therefore 0.90 is PASS when the threshold is 0.90.")
+} else cat("_No linearity diagnostics available._\n")
+```
+
+```{r, echo=FALSE, results='asis'}
+show_plot("02_diagnostics/plots/cm_vs_rm_linearity.png")
+figure_note("CM versus RM linearity plot within the configured fitting range. The 1:1 reference, configured regression fit and smooth trend help identify proportional or nonlinear behaviour.")
+```
+
+## Correction coefficients
+
+This section answers the question: **which correction model was estimated and what are its calibration coefficients?**
+
+Only two reporting stages are retained in the compact report: **No correction** and **After correction**. The detailed correction model is shown only here through the `Model` column. Correction coefficients are estimated using the configured correction model. Regression-based coefficients use the configured fitting range shown in the table. Values above this range are not removed from the uncertainty assessment; they are only excluded from the regression used to evaluate linearity and derive the correction function.
+
+```{r}
+if (nrow(corrections) > 0) {
+  corrections %>%
+    select(any_of(c("Instrument", "Size", "correction_model", "tls_fit_range", "n_regression", "n_regression_total", "n_regression_excluded", "slope", "intercept", "ratio_factor", "ubsRM"))) %>%
+    show_table(digits = 2)
+  table_note("Correction coefficients estimated globally for each Instrument × Pollutant using the configured fitting range shown in the table. Annual and daily uncertainty calculations remain based on their own assessment datasets.")
+} else cat("_No correction coefficients available._\n")
+```
+
+
+
+# CM diagnostic assessment
+
+Diagnostics are interpretative support for the uncertainty assessment. They include bias, residual spread, CI95, skewness and kurtosis. Values highlighted in orange exceed the diagnostic thresholds from the diagnostic methodology table.
+
+## Difference diagnostics: CM - RM
+
+This section evaluates the distribution and structure of the paired differences \(CM - RM_{AVG}\). It identifies systematic bias, excessive random scatter, asymmetry, heavy tails and outlying observations.
+
+```{r diagnostic-thresholds, echo=FALSE}
+diagnostic_thresholds <- tibble::tibble(
+  Indicator = c("|MBE|", "SD(diff)", "Ubs,CM", "|Skew|", "Kurt"),
+  Meaning = c(
+    "Mean CM-RM bias",
+    "Spread of CM-RM differences",
+    "Candidate unit precision",
+    "Residual asymmetry",
+    "Tail heaviness"
+  ),
+  Threshold = c("1 µg/m³", "2.5 µg/m³", "2.5 µg/m³", "0.5", "4"),
+  Interpretation = c(
+    "Possible systematic offset",
+    "Elevated random scatter",
+    "Insufficient instrumental precision",
+    "Asymmetric residual distribution",
+    "Heavy tails or outliers"
+  )
+)
+show_table(diagnostic_thresholds, digits = 1)
+table_note("Diagnostic threshold table used to interpret orange highlights in the CM-RM difference diagnostics.")
+```
+
+Orange cells indicate diagnostic values exceeding the predefined thresholds. Exceedance does not automatically imply non-equivalence, but it indicates that correction or additional investigation may be required.
+
+```{r}
+if (nrow(diff_diag) > 0) {
+  diff_diag %>%
+    select(any_of(c("Instrument", "Size", "CM_type", "Stage", "n", "MBE", "MBE_threshold", "SD_diff", "SD_threshold", "RMSE", "skewness", "skewness_threshold", "kurtosis", "kurtosis_threshold", "Ubs_CM", "Ubs_CM_threshold", "diagnostic_status"))) %>%
+    show_diagnostic_table(digits = 1)
+  table_note("Difference diagnostics for CM − RM. Orange cells exceed diagnostic thresholds and indicate values requiring interpretation, not automatic non-equivalence.")
+} else cat("_No CM difference diagnostics available._\n")
+```
+
+
+### Site/campaign difference diagnostics: CM - RM
+
+This table applies the same CM--RM diagnostic indicators at site/campaign level. It is intended to identify local bias, local scatter or distributional issues that may be hidden in the method-level diagnostic table. Orange cells use the same diagnostic thresholds as the method-level table.
+
+```{r}
+if (nrow(diff_site_diag) > 0) {
+  diff_site_diag %>%
+    select(any_of(c("Instrument", "Size", "CM_type", "Site", "Campaign", "Stage",
+                    "n", "MBE", "MBE_threshold", "SD_diff", "SD_threshold",
+                    "RMSE", "skewness", "skewness_threshold",
+                    "kurtosis", "kurtosis_threshold", "Ubs_CM", "Ubs_CM_threshold",
+                    "diagnostic_status"))) %>%
+    show_diagnostic_table(digits = 1)
+  table_note("Site/campaign CM − RM diagnostics. Orange cells exceed diagnostic thresholds and indicate local behaviour requiring interpretation, not automatic non-equivalence.")
+} else cat("_No site/campaign CM difference diagnostics available._\n")
+```
+
+
+```{r, echo=FALSE, results='asis'}
+show_plot("02_diagnostics/plots/cm_bland_altman.png")
+figure_note("Bland-Altman diagnostic for CM − RM versus RM. All points are shown, but the LOESS smoother is fitted only within 0 ≤ RMAVG ≤ 1.5 × LVd. Outside-range points are shown in black so that isolated high-concentration points do not distort the smoother.")
+show_plot("02_diagnostics/plots/cm_difference_histogram.png")
+show_plot("02_diagnostics/plots/cm_difference_time_series.png")
+figure_note("Difference diagnostics: Bland-Altman, distribution and time-series views of CM − RM residuals.")
+```
+
+# Uncertainty calculation methodology
+
+This section explains how the daily and annual uncertainty metrics are calculated, and why the two calculations are different. The notation is aligned with the column names used in the report tables: **Random**, **Bias d**, **Random y**, **Bias y**, **Udaily (%LVd)** and **Uann (%LVy)**.
+
+## General notation
+
+The uncertainty assessment is based on paired observations between the candidate method (CM) and the reference method (RM). For row $i$, the working reference value is:
+
+$$
+RM_{AVG,i} = \operatorname{mean}(RM_{1,i}, RM_{2,i})
+$$
+
+where:
+
+- $i$ is the row index, corresponding to one paired measurement day or observation time in the screened dataset.
+- $RM_{1,i}$ and $RM_{2,i}$ are the two reference-method measurements for row $i$, when both are available.
+- $RM_{AVG,i}$ is the working reference concentration used for comparison with the candidate method.
+- If only one reference measurement is available for row $i$, the available RM value is used as $RM_{AVG,i}$.
+
+Candidate units are evaluated separately. For candidate unit $u$, the paired CM--RM difference is:
+
+$$
+d_{i,u} = CM_{i,u} - RM_{AVG,i}
+$$
+
+where:
+
+- $u$ identifies the candidate-method unit, usually CM1 or CM2.
+- $CM_{i,u}$ is the concentration measured by candidate unit $u$ for row $i$.
+- $d_{i,u}$ is the candidate-reference difference for row $i$ and unit $u$.
+- A positive value of $d_{i,u}$ means that the candidate method is higher than the reference method; a negative value means that it is lower.
+
+The mean difference, also reported conceptually as the mean bias error (MBE), is:
+
+$$
+\bar{d}_u = MBE_u = \frac{1}{n_u}\sum_{i=1}^{n_u} d_{i,u}
+$$
+
+where:
+
+- $\bar{d}_u$ is the mean CM--RM difference for candidate unit $u$.
+- $MBE_u$ is the mean bias error for candidate unit $u$.
+- $n_u$ is the number of valid paired observations available for candidate unit $u$ in the dataset being evaluated.
+- The summation is over all valid observations used for that specific calculation.
+
+The sample variance of the paired differences is:
+
+$$
+s^2_{d,u} =
+\frac{1}{n_u - 1}
+\sum_{i=1}^{n_u}
+\left(d_{i,u} - \bar{d}_u\right)^2
+$$
+
+where:
+
+- $s^2_{d,u}$ is the sample variance of the CM--RM differences for candidate unit $u$.
+- $d_{i,u} - \bar{d}_u$ is the deviation of each paired difference from the mean difference.
+- The denominator $n_u - 1$ is the usual degrees-of-freedom correction for a sample variance.
+
+When duplicate RM measurements are available, the between-reference component is estimated as:
+
+$$
+u_{bsRM} =
+\sqrt{
+\frac{
+\sum_{i \in R}
+\left(RM_{1,i} - RM_{2,i}\right)^2
+}{
+2 n_R
+}
+}
+$$
+
+where:
+
+- $u_{bsRM}$ is the uncertainty component associated with the reproducibility of duplicate RM measurements.
+- $R$ is the set of rows for which both RM1 and RM2 are available and retained after RM screening.
+- $n_R$ is the number of rows in the set $R$.
+- The denominator $2 n_R$ converts duplicate RM differences into a single-reference standard uncertainty component.
+
+For each campaign or site/campaign block $c$, the campaign-specific mean bias is:
+
+$$
+b_{c,u} =
+\frac{1}{n_{c,u}}
+\sum_{i \in c}
+d_{i,u}
+$$
+
+where:
+
+- $c$ identifies a campaign or site/campaign block used in the bias decomposition.
+- $n_{c,u}$ is the number of valid paired observations for candidate unit $u$ in block $c$.
+- $b_{c,u}$ is the mean CM--RM difference for candidate unit $u$ within block $c$.
+
+The residual after removing the campaign-specific mean bias is:
+
+$$
+\varepsilon_{i,u} = d_{i,u} - b_{c(i),u}
+$$
+
+where:
+
+- $\varepsilon_{i,u}$ is the residual difference for row $i$ and candidate unit $u$ after removing the mean bias of its campaign block.
+- $c(i)$ denotes the campaign or site/campaign block containing row $i$.
+- $b_{c(i),u}$ is the mean bias of the block to which observation $i$ belongs.
+
+The pooled within-campaign residual standard deviation is:
+
+$$
+s_{\varepsilon,u} =
+\sqrt{
+\frac{
+\sum_{i=1}^{n_u}
+\varepsilon_{i,u}^2
+}{
+n_u - G_u
+}
+}
+$$
+
+where:
+
+- $s_{\varepsilon,u}$ is the pooled residual standard deviation for candidate unit $u$ after removing campaign-specific mean biases.
+- $G_u$ is the number of campaign or site/campaign blocks available for candidate unit $u$.
+- The denominator $n_u - G_u$ is used because one campaign-specific mean bias is estimated and removed for each of the $G_u$ blocks. Therefore, $G_u$ degrees of freedom are consumed by the block-level bias estimates.
+- $G_u$ is not an autocorrelation correction. It is a degrees-of-freedom correction associated with the campaign-level bias decomposition.
+
+The corrected random component used in the report is:
+
+$$
+Random_u =
+\sqrt{
+\max\left(
+s_{\varepsilon,u}^2 - u_{bsRM}^2,\ 0
+\right)
+}
+$$
+
+where:
+
+- $Random_u$ is the corrected random component for candidate unit $u$.
+- $s_{\varepsilon,u}$ is the pooled within-campaign residual standard deviation.
+- $u_{bsRM}$ is subtracted in variance to avoid attributing duplicate-RM reproducibility to the candidate method.
+- The function $\max(\cdot,0)$ prevents negative variances when the estimated RM component is larger than the residual variance.
+
+## Daily uncertainty
+
+For the daily limit-value assessment, only observations in the local daily LV window are used:
+
+$$
+0.7\,LV_d \le RM_{AVG,i} \le 1.3\,LV_d
+$$
+
+where:
+
+- $LV_d$ is the daily limit value for the pollutant being assessed.
+- $RM_{AVG,i}$ is the working reference concentration for row $i$.
+- The window selects observations whose reference concentration is close to the daily limit value.
+
+The metric used for **Result d** is selected in the configuration file. The report therefore shows two daily columns:
+
+- **Metric d**, which gives the name of the configured daily decision metric.
+- **Metric d (%LVd)**, which gives the value of that metric as a percentage of the daily limit value.
+
+The daily result is obtained by comparing **Metric d (%LVd)** with the applicable daily DQO, provided that the number of daily-LV observations is sufficient. When the number of observations is in the low-N warning range, the metric value is displayed but the result is reported as **LOW N**, not as PASS or FAIL.
+
+The currently available daily decision metrics are described below.
+
+### Empirical percentile indicator
+
+$$
+CI95_{d,u}
+=
+Q_{0.95}
+\left(
+\left|d_{i,u}\right|
+\right)
+$$
+
+where:
+
+- $CI95_{d,u}$ is the empirical 95th percentile of the absolute CM--RM differences for candidate unit $u$ in the daily LV window.
+- $Q_{0.95}$ is the empirical 95th percentile operator.
+- $d_{i,u}$ is the CM--RM difference for observation $i$ and candidate unit $u$.
+- $\left|d_{i,u}\right|$ is the absolute CM--RM difference.
+- This indicator provides a non-parametric summary of the upper tail of the observed absolute differences, without assuming a specific residual distribution.
+
+The relative form is:
+
+$$
+CI95_{d,u}(\%LV_d)
+=
+100
+\frac{
+CI95_{d,u}
+}{
+LV_d
+}
+$$
+
+### Difference-based indicators
+
+Two difference-based indicators are retained for comparison and can also be selected in the configuration:
+
+$$
+U_{tot,d,u}
+=
+2\sqrt{
+SD(diff)_u^2 + MBE_u^2
+}
+$$
+
+$$
+U_{diff,d,u}
+=
+2\sqrt{
+\max\left(SD(diff)_u^2 - u_{bsRM}^2,\ 0\right) + MBE_u^2
+}
+$$
+
+where:
+
+- $U_{tot,d,u}$ is a difference-based indicator using the observed spread and mean bias of the CM--RM differences.
+- $U_{diff,d,u}$ is the corresponding indicator after subtracting the between-reference component $u_{bsRM}$ in variance, when duplicate RM data are available.
+- $SD(diff)_u$ is the standard deviation of the CM--RM differences in the daily LV window.
+- $MBE_u$ is the mean bias error in the daily LV window.
+- These indicators combine random scatter and mean displacement in a simplified way; their interpretation should therefore be considered with caution.
+
+### Decomposed daily metric
+
+A decomposed daily metric is also calculated:
+
+$$
+U_{daily,u}^{decomp}
+=
+2\,Random_u + Bias_{d,u}
+$$
+
+where:
+
+- $U_{daily,u}^{decomp}$ is reported in the Annex as **Decomposed daily (%LVd)**.
+- $Random_u$ is the corrected residual random component.
+- $Bias_{d,u}$ is the residual daily bias component.
+- The factor 2 is applied only to the random component because this component is treated as a standard uncertainty component.
+- The residual bias component is added explicitly and is not multiplied by 2, because it represents an observed systematic displacement rather than a random standard uncertainty.
+- The linear addition is used to keep the expanded random component and the explicit residual bias component conceptually separate.
+
+The following descriptive diagnostics may also be shown in the daily tables:
+
+$$
+MBE_u
+=
+\frac{1}{n_u}
+\sum_{i=1}^{n_u}
+d_{i,u}
+$$
+
+where:
+
+- $MBE_u$ is the mean bias error for candidate unit $u$ in the daily LV window.
+- It is a signed average difference: positive values indicate that CM is higher than RM on average, and negative values indicate that CM is lower than RM on average.
+
+$$
+SD(diff)_u
+=
+\sqrt{
+\frac{1}{n_u - 1}
+\sum_{i=1}^{n_u}
+\left(
+d_{i,u} - MBE_u
+\right)^2
+}
+$$
+
+where:
+
+- $SD(diff)_u$ is the sample standard deviation of the CM--RM differences in the daily LV window.
+- It describes the spread of the daily differences around their mean value.
+- $MBE$ and $SD(diff)$ are diagnostic quantities for interpretation; they are not, by themselves, the daily decision metric unless the configured metric uses them.
+
+## Annual uncertainty
+
+For the annual assessment, all screened valid paired data are used. Unlike the daily assessment, no daily-LV concentration window is applied, because all valid daily concentrations contribute to the annual mean.
+
+The effective sample size would be derived from the temporal autocorrelation of the concentration time series at a site. The variance-inflation factor $V$ could be selected according to the following hierarchy:
+
+1. **Direct estimation from the equivalence dataset** -- If the equivalence dataset contains a sufficient number of consecutive daily observations, $V$ could be estimated directly from the site-pollutant time series in the equivalence dataset, using $RM_{AVG}$ where available.
+
+2. **Alternative estimation using CM observations** -- If $RM_{AVG}$ is unavailable or unsuitable, CM observations from the equivalence dataset could be used, provided that they form a quality-controlled daily concentration time series that is representative of the pollutant dynamics at that site.
+
+3. **Auxiliary daily site series** -- If the equivalence dataset does not contain enough consecutive daily pairs, an auxiliary daily time series for the same site and pollutant could be used. This auxiliary series could originate from a fixed monitoring station, a reference method, or an equivalent analyser, provided that it is validated, quality-controlled, and reasonably representative of the pollutant dynamics at that site. Ideally, it should cover the same year, or a period close to the year being assessed for annual uncertainty.
+
+4. **Representative pollutant-level factor as fallback** -- If neither the equivalence dataset nor the auxiliary site-pollutant series provides a sufficient number of consecutive daily pairs, a representative pollutant-level variance-inflation factor, $V_{rep}$, could be adopted.
+
+$V_{rep}$ would represent a fallback estimate of temporal autocorrelation at pollutant level. It would be derived from the available testing-type datasets shared within the working group, by calculating site- and pollutant-specific $V$ values where sufficient consecutive daily data are available and then summarising them into a representative value for each pollutant. This prevents the annual uncertainty calculation from assuming independent daily observations when site-specific autocorrelation cannot be estimated directly.
+
+The auxiliary time series, when used, would only support the estimation of temporal autocorrelation, $V$, and the effective sample size, $N_{eff}$. It would not be used to estimate CM--RM bias, random scatter, correction coefficients, linearity, or any other component of the equivalence assessment.
+
+Daily air-quality concentrations are often temporally autocorrelated. This means that two consecutive daily concentrations may carry partly redundant information. Meteorology, atmospheric stability, regional pollution episodes, long-range transport and precipitation can all make the concentration on one day related to the concentration on the previous day. If this dependence is ignored, the uncertainty of the annual mean can be underestimated.
+
+Let the concentration time series used for estimating autocorrelation in group $g$ be:
+
+$$
+y_t
+$$
+
+where:
+
+- $t$ is the time index, expressed in days.
+- $y_t$ is the daily concentration on day $t$.
+- $g$ is a site/campaign block used to estimate temporal autocorrelation.
+- Depending on the hierarchy above, $y_t$ may be based on $RM_{AVG}$, CM observations, an auxiliary daily series, or replaced by the representative pollutant-level factor $V_{rep}$ when no direct estimate is possible.
+
+The lag-1 autocorrelation coefficient is estimated from consecutive-day pairs:
+
+$$
+\hat{\rho}_{1,g}
+=
+\operatorname{corr}
+\left(
+\{y_{t-1}\},
+\{y_t\}
+\right)
+$$
+
+where:
+
+- $\hat{\rho}_{1,g}$ is the estimated lag-1 autocorrelation coefficient for group $g$.
+- The two sets in the correlation contain only pairs of observations separated by one day.
+- The first set contains the previous-day concentrations $y_{t-1}$.
+- The second set contains the following-day concentrations $y_t$.
+- Values of $\hat{\rho}_{1,g}$ close to 1 indicate strong temporal persistence; values close to 0 indicate weak day-to-day dependence.
+
+Under the AR(1) approximation, the variance inflation factor is:
+
+$$
+V_g =
+\frac{
+1 + \hat{\rho}_{1,g}
+}{
+1 - \hat{\rho}_{1,g}
+}
+$$
+
+where:
+
+- $V_g$ is the variance inflation factor for site/campaign group $g$.
+- A larger $V_g$ means that the nominal number of daily observations contains less independent information.
+- If $\hat{\rho}_{1,g}=0$, then $V_g=1$ and no autocorrelation inflation is applied.
+
+The effective annual sample size for candidate unit $u$ is:
+
+$$
+N_{eff,u} =
+\sum_g
+\frac{
+n_{u,g}
+}{
+V_g
+}
+$$
+
+where:
+
+- $N_{eff,u}$ is the effective number of independent observations contributing to the annual mean for candidate unit $u$.
+- $n_{u,g}$ is the number of valid observations for candidate unit $u$ in site/campaign group $g$.
+- $V_g$ is the variance inflation factor used for group $g$.
+- The summation is over all site/campaign groups contributing to the annual assessment dataset for unit $u$.
+
+For the annual assessment, campaign biases are combined with their algebraic sign:
+
+$$
+B_{y,u} =
+\left|
+\sum_c
+w_{c,u}
+b_{c,u}
+\right|
+$$
+
+where:
+
+- $B_{y,u}$ is the annual bias component for candidate unit $u$, reported as **Bias y**.
+- $b_{c,u}$ is the mean CM--RM bias for unit $u$ in campaign or site/campaign block $c$.
+- $w_{c,u}$ is the weight of block $c$, calculated from its number of valid observations.
+- "With their algebraic sign" means that positive and negative values of $b_{c,u}$ are averaged before taking the absolute value of the final weighted sum.
+- This is appropriate for the annual mean because the measurand is itself a time average. A positive bias in one period and a negative bias in another period can partly compensate in the annual average.
+
+The annual random component is:
+
+$$
+Random_{y,u} =
+\frac{
+Random_u
+}{
+\sqrt{N_{eff,u}}
+}
+$$
+
+where:
+
+- $Random_{y,u}$ is the random component of the annual mean for candidate unit $u$, reported as **Random y**.
+- $Random_u$ is the corrected random component estimated from the residual CM--RM variability.
+- $N_{eff,u}$ is the effective annual sample size.
+
+The annual uncertainty metric used for the final assessment is:
+
+$$
+U_{annual,u} =
+2\,Random_{y,u} + B_{y,u}
+$$
+
+where:
+
+- $U_{annual,u}$ is the expanded annual uncertainty metric for candidate unit $u$, reported as **Uann (%LVy)** after division by the annual limit value.
+- $Random_{y,u}$ is the annual random component, reported as **Random y**.
+- $B_{y,u}$ is the annual bias component, reported as **Bias y**.
+- As in the daily metric, the factor 2 is applied only to the random component, while the residual bias is added explicitly.
+- The annual metric above is used for the annual assessment. The daily metric used for **Result d** is the metric selected in the configuration file; additional daily indicators are retained in the Annex for interpretation and traceability.
+
+
+# Daily and annual LV assessment
+
+This section answers the question: **is the estimated uncertainty compatible with the daily and annual limit-value requirements?**
+
+## Daily LV assessment
+
+The daily decision metric is defined in the configuration used for the run. Additional methodological and historical indicators are reported in the Annex for comparison and interpretation.
+
+```{r}
+if (nrow(daily_unit) > 0) {
+  daily_unit %>%
+    select(any_of(c("Instrument", "Size", "CM_type", "Stage", "n_LV", "mean_RM", "mean_CM", "MBE", "SD_diff", "daily_decision_metric", "daily_metric_rel_LV_pct", "daily_status"))) %>%
+    show_table(digits = 1)
+  table_note("Daily LV assessment by CM unit. Result d is based on the configured Metric d when nLV is sufficient. Low-N daily estimates are reported as LOW N rather than PASS/FAIL. MBE and SD(diff) are descriptive diagnostics.")
+} else cat("_No daily unit results available._\n")
+```
+
+```{r, echo=FALSE, results='asis'}
+show_plot("04_plots/daily_primary_uncertainty.png")
+figure_note("Decomposed daily diagnostic by CM unit. Bars show the expanded random component and residual bias component. This plot is retained for interpretation; the formal daily decision is based on the configured Metric d shown in the table. The dashed line is the daily DQO reference.")
+```
+
+## Daily site/campaign LV assessment
+
+This section evaluates whether the daily LV-window uncertainty remains acceptable within individual site/campaign conditions. It is intended to identify local transferability issues that may be hidden by the aggregated method-level assessment.
+
+```{r}
+if (nrow(daily_site) > 0) {
+  daily_site %>%
+    select(any_of(c("Instrument", "Size", "CM_type", "Site", "Campaign", "Stage", "n_LV", "MBE", "SD_diff", "daily_decision_metric", "daily_metric_rel_LV_pct", "daily_site_status"))) %>%
+    show_table(digits = 1)
+  table_note("Daily site/campaign LV assessment. Result d is based on the configured Metric d when nLV is sufficient. Low-N site/campaign estimates are reported as LOW N rather than PASS/FAIL. MBE and SD(diff) describe the signed bias and scatter within each LV window.")
+} else cat("_No daily site/campaign results available._\n")
+```
+
+```{r, echo=FALSE, results='asis'}
+show_plot("04_plots/daily_site_campaign_guardrail.png")
+figure_note("Site/campaign-level daily LV assessment. Points show the configured daily decision metric selected in the configuration file and compare no correction and after correction against the DQO reference.")
+```
+
+## Annual LV assessment
+
+```{r}
+if (nrow(annual_unit) > 0) {
+  annual_unit %>%
+    select(any_of(c("Instrument", "Size", "CM_type", "Stage", "n_annual", "Neff", "mean_RM", "mean_CM", "u_annual_random", "u_annual_bias", "u_annual_rel_LV_pct", "annual_status"))) %>%
+    show_table(digits = 1)
+  table_note("Annual LV assessment by CM unit. Random y is Random divided by sqrt(Neff); Uann combines 2 × Random y and Bias y.")
+} else cat("_No annual unit results available._\n")
+```
+
+```{r, echo=FALSE, results='asis'}
+show_plot("04_plots/annual_primary_uncertainty.png")
+figure_note("Annual uncertainty components by CM unit. Bars separate the expanded annual random component and annual bias; the dashed line is the annual DQO reference.")
+```
+
+## Annual site/campaign uncertainty
+
+This section applies the annual uncertainty logic separately at site/campaign level. Unlike the daily site/campaign LV assessment, it uses all valid screened data available in each site/campaign block, not only the daily LV ±30% window. The effective sample-size inputs used for the annual random component are reported in the Annex.
+
+```{r}
+if (nrow(annual_site) > 0) {
+  annual_site %>%
+    select(any_of(c("Instrument", "Size", "CM_type", "Site", "Campaign", "Stage", "n_annual", "u_annual_random", "u_annual_bias", "u_annual_rel_LV_pct", "annual_site_status"))) %>%
+    show_table(digits = 1)
+  table_note("Annual site/campaign assessment using all valid screened data available in each site/campaign block. The effective annual sample-size calculation is documented in the Annex.")
+} else cat("_No annual site/campaign results available._\n")
+```
+
+```{r, echo=FALSE, results='asis'}
+show_plot("04_plots/annual_site_campaign_uncertainty.png")
+figure_note("Annual site/campaign uncertainty assessment. Points show Uann (%LVy) and compare no correction and after correction against the annual DQO reference at site/campaign level.")
+```
+
+# Final combined site assessment
+
+This section answers the question: **what is the final site-level decision when daily and annual assessments are considered together?**
+
+The decision rule is conservative: a failure at any relevant daily or annual level leads to FAIL. LOW N is treated as a warning, not as a failure; low-N daily estimates are not converted into PASS/FAIL daily decisions. If the daily assessment is not assessable, or is only LOW N, the annual result can support a PASS only when the annual assessment passes and no site-level failure is present.
+
+```{r}
+if (nrow(final_site) > 0) {
+  final_site %>%
+    select(any_of(c("Instrument", "Size", "CM_type", "Site", "Stage", "n_LV_total", "n_annual", "mean_RM_daily", "mean_CM_daily", "mean_RM_annual", "mean_CM_annual", "daily_decision_metric", "daily_metric_rel_LV_pct", "u_annual_rel_LV_pct", "daily_assessment_status", "annual_assessment_status", "final_site_status", "decision_basis"))) %>%
+    show_table(digits = 1)
+  table_note("Final site-level decision table. LOW N indicates that the daily assessment has low sample size; when annual assessment passes, the final decision can still pass.")
+} else cat("_No final combined site assessment available._\n")
+```
+
+# Annex: Daily LV comparison metrics
+
+This annex compares the daily LV metric used for the daily assessment with additional methodological and historical indicators. The purpose is to support interpretation and comparison between alternative approaches; the metric used for the formal daily decision is defined in the configuration used for the run.
+
+- **WAMS full** is the historical GDE-style regression-based metric evaluated over the full concentration range.
+
+- **WAMS LV-window** applies the same regression-based structure only within the daily LV window. It is included as a local sensitivity indicator around the daily limit value.
+
+- **CI95** is an empirical percentile-based indicator. It represents the 95th percentile of the absolute CM--RM differences in the daily LV window. It provides a non-parametric way to evaluate the distribution of observed differences without assuming a specific residual distribution.
+
+- **Utot** and **Udiff** are difference-based indicators. **Udiff** subtracts the between-reference component, $u_{bsRM}$, in variance when duplicate RM data are available. These indicators are retained for comparison and traceability, but their interpretation should be considered with caution because they combine random and systematic effects in a simplified way.
+
+- **The decomposed daily metric** separates the daily assessment into an expanded random component and an explicit residual bias component. The random component is multiplied by 2 because it is treated as a standard uncertainty component. The residual bias component is added explicitly and is not multiplied by 2, because it represents an observed systematic displacement rather than a random standard uncertainty. This metric is included to make the relative contribution of random scatter and residual bias transparent.
+
+Local site/campaign daily results are evaluated separately in the site/campaign table and in the executive summary. They are used to identify local transferability issues that may not be visible in the aggregated daily assessment.
+
+```{r}
+if (nrow(daily_comparison) > 0) {
+  daily_comparison %>%
+    select(any_of(c(
+      "Instrument", "Size", "CM_type", "Stage", "n_LV",
+      "WAMS_full_rel_LV_pct", "WAMS_LV_window_rel_LV_pct",
+      "CI95_rel_LV_pct", "Utot_rel_LV_pct", "Udiff_rel_LV_pct",
+      "u_daily_rel_LV_pct", "daily_status"
+    ))) %>%
+    show_table(digits = 1)
+  table_note("Daily LV comparison indicators. The configured daily decision metric is defined in the configuration used for the run; the other indicators are retained for comparison, interpretation and traceability.")
+} else cat("_No daily LV comparison metrics available._\n")
+```
+
+
+
+# Annex: annual autocorrelation and Neff inputs
+
+This table reports the variance-inflation factor used for the annual effective sample-size calculation. \(V\) is estimated from consecutive daily concentration pairs when available; otherwise, a representative pollutant-level \(V_{rep}\) is used. The Neff contribution is calculated as the number of observations divided by the \(V\) used for that site/pollutant block.
+
+```{r}
+if (nrow(neff_inputs) > 0) {
+  prepare_neff_annex_table(neff_inputs) %>%
+    show_table(digits = 2)
+  table_note("Annual autocorrelation and Neff inputs. Detailed diagnostic columns for RM, CM and auxiliary-series candidates are retained in the CSV/Excel outputs.")
+} else cat("_No annual autocorrelation/Neff input table available._\n")
+```
+
+
+# Appendix: interpretation notes and extended metrics
+
+The compact report keeps extended autocorrelation diagnostics, `u_slope`, `u_intercept`, and optional influence/outlier sensitivity diagnostics outside the main sections. These quantities remain available in the Excel/CSV outputs for technical review and traceability.
+
+The report is daily-first by design. Annual assessment is always performed. The reported stages are **No correction** and, where available, **After correction**. The `Model` column appears only in the correction-coefficient table.
